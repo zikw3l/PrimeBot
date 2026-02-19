@@ -3,12 +3,12 @@ import telebot
 import google.generativeai as genai
 from flask import Flask
 from threading import Thread
-
-# 1. НАСТРОЙКА ЛОГОВ (чтобы всё видеть в Render)
 import logging
-logging.basicConfig(level=logging.INFO)
 
-# 2. ИНИЦИАЛИЗАЦИЯ КЛЮЧЕЙ
+# Настройка логирования для Render
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# 1. ЗАГРУЗКА ДАННЫХ
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 GEMINI_KEY = os.environ.get('GEMINI_API_KEY')
 ADMIN_ID = os.environ.get('MY_PERSONAL_ID')
@@ -16,63 +16,75 @@ ADMIN_ID = os.environ.get('MY_PERSONAL_ID')
 bot = telebot.TeleBot(TOKEN)
 genai.configure(api_key=GEMINI_KEY)
 
-# Настройка промпта для риелтора
+# Инструкция для ИИ
 SYSTEM_PROMPT = """
 Ты — профессиональный ИИ-ассистент агентства недвижимости 'Prime Estate'. 
 Твоя цель: вежливо ответить клиенту и квалифицировать его. 
 Обязательно уточни: локацию, бюджет и когда планируют покупку.
-Если клиент оставил телефон или имя — похвали его. 
+Если клиент оставил телефон или имя — похвали его и скажи, что эксперт свяжется скоро.
 Пиши кратко, профессионально и дружелюбно.
 """
 
-# 3. ФЕЙКОВЫЙ ВЕБ-СЕРВЕР (чтобы Render не выключал бота)
+# 2. ВЕБ-СЕРВЕР ДЛЯ RENDER (чтобы сервис не засыпал)
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "PrimeBot is alive!"
+    return "PrimeBot is running!"
 
 def run_flask():
     app.run(host='0.0.0.0', port=8080)
 
-# 4. ОБРАБОТКА СООБЩЕНИЙ
+# 3. ОБРАБОТКА КОМАНДЫ /START
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
+    logging.info(f"User {message.chat.id} started the bot")
     bot.reply_to(message, "Здравствуйте! Я PrimeBot — ваш интеллектуальный помощник. Какую недвижимость вы ищете?")
 
+# 4. ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     user_text = message.text
     chat_id = message.chat.id
 
     try:
-        # Работа с Gemini
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(f"{SYSTEM_PROMPT}\n\nВопрос клиента: {user_text}")
-        
-        bot_reply = response.text
-        bot.send_message(chat_id, bot_reply)
+        # Пытаемся по очереди разные названия моделей, чтобы избежать ошибки 404
+        response = None
+        for model_name in ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(f"{SYSTEM_PROMPT}\n\nКлиент пишет: {user_text}")
+                if response:
+                    break
+            except Exception as e:
+                logging.warning(f"Модель {model_name} недоступна: {e}")
+                continue
 
-        # Пересылка лида админу (тебе)
-        if ADMIN_ID:
-            lead_info = f"🔥 НОВЫЙ ЛИД!\n👤 От: @{message.from_user.username}\n💬 Текст: {user_text}"
-            bot.send_message(ADMIN_ID, lead_info)
+        if response and response.text:
+            bot_reply = response.text
+            bot.send_message(chat_id, bot_reply)
+            
+            # Отправка уведомления админу (вам)
+            if ADMIN_ID:
+                lead_info = f"🔥 НОВЫЙ ЛИД!\n👤 От: @{message.from_user.username or 'скрыто'}\n💬 Текст: {user_text}"
+                bot.send_message(ADMIN_ID, lead_info)
+        else:
+            bot.send_message(chat_id, "Извините, я немного задумался. Попробуйте перефразировать запрос.")
 
     except Exception as e:
-        error_msg = str(e)
-        logging.error(f"Ошибка: {error_msg}")
-        # Бот честно скажет, в чем проблема (ключ, регион или фильтры)
-        bot.send_message(chat_id, f"⚠️ Ошибка API: {error_msg[:100]}...")
+        logging.error(f"Критическая ошибка: {e}")
+        bot.send_message(chat_id, f"⚠️ Ошибка API: {str(e)[:50]}...")
 
-# 5. ЗАПУСК
+# 5. ЗАПУСК ПРИЛОЖЕНИЯ
 if __name__ == "__main__":
-    # Сначала сбрасываем вебхуки, чтобы не было ошибки 409 Conflict
+    # Сброс вебхуков для предотвращения ошибки 409 Conflict
     bot.remove_webhook()
     
-    # Запускаем Flask в отдельном потоке
+    # Запуск Flask в фоновом потоке
     t = Thread(target=run_flask)
+    t.daemon = True
     t.start()
     
-    print("Бот запускается...")
-    # Запускаем бесконечный опрос Telegram
-    bot.infinity_polling(timeout=10, long_polling_timeout=5)
+    logging.info("Бот запускается в режиме Polling...")
+    # Запуск бесконечного опроса
+    bot.infinity_polling(timeout=20, long_polling_timeout=10)
